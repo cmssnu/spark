@@ -1,34 +1,80 @@
 package org.apache.spark.deploy.reef
 
-import java.io.File
+import java.io.{File, FileInputStream, IOException}
 import java.net.URL
+import java.util.Properties
 import java.util.concurrent.atomic.AtomicReference
 
+import org.apache.log4j.PropertyConfigurator
 import org.apache.spark.executor.ExecutorURLClassLoader
 import org.apache.spark.scheduler.cluster.CoarseGrainedSchedulerBackend
 import org.apache.spark.util.Utils
-import org.apache.spark.{Logging, SparkConf, SparkContext}
+import org.apache.spark.{Logging, SparkConf, SparkContext, SparkException}
 
 import scala.beans.BeanProperty
 
 /**
- * Spark-REEF API
- * REEFDriverDelegate halts Spark task scheduler
- * until SparkContext is initialized
+ * REEFDriverDelegate object for Spark-REEF API
+ * starts user defined class, and halts
+ * Spark task scheduler until SparkContext is initialized.
  */
 object REEFDriverDelegate extends Logging {
 
   val sparkContextRef: AtomicReference[SparkContext] = new AtomicReference[SparkContext](null)
+  //create getter & setter for Spark Driver URL
   @BeanProperty var driverURL: String = null
   var sparkConf: SparkConf = null
-  // Variable used to notify the REEFClusterScheduler that it should stop waiting
-  // for the initial set of executors to be started and get on with its business.
+  // variable used to notify the REEFClusterScheduler
   val doneWithREEFEvaluatorInitMonitor = new Object() // lock for REEF Evaluator
   val doneWithSparkContextInitMonitor = new Object() //lock for SparkContext
   @volatile var isDoneWithSparkContextInit = false
   @volatile var isDoneWithREEFEvaluatorInit = false
   var isFinished: Boolean = false
 
+  /**
+   *
+   * Load properties present in the given file.
+   *
+   * @return
+   */
+  def setSystemPropertiesFromFile(file: File) {
+    require(file.exists(), s"Properties file $file does not exist")
+    require(file.isFile(), s"Properties file $file is not a normal file")
+    val inputStream = new FileInputStream(file)
+    try {
+      val properties = new Properties()
+      properties.load(inputStream)
+      setSystemProperties(properties)
+    } catch {
+      case e: IOException =>
+        val message = s"Failed when loading Spark properties file $file"
+        throw new SparkException(message, e)
+    } finally {
+      inputStream.close()
+    }
+  }
+
+  /**
+   *
+   * Sets up System property for SparkConf.
+   *
+   * @return
+   */
+  def setSystemProperties(sparkArgs: Properties) {
+    val sparkProperty: Properties = System.getProperties
+    sparkProperty.putAll(sparkArgs)
+    System.setProperties(sparkProperty)
+  }
+
+  /**
+   *
+   * Called from REEFDriver.
+   * Runs userClass in a separate Thread.
+   *
+   * @param userClass user class
+   * @param userArgs user arguments
+   * @return Thread
+   */
   def startUserClass(userClass: String, userArgs: Array[String]): Thread = {
     logInfo("Starting the user class in a separate Thread")
 
@@ -36,6 +82,13 @@ object REEFDriverDelegate extends Logging {
       Thread.currentThread.getContextClassLoader)
     Thread.currentThread.setContextClassLoader(loader)
 
+
+    //retrieve log4j.prop here
+    val url = loader.getResource("log4j-spark-reef.properties")
+    PropertyConfigurator.configure(url)
+
+    // Add spark.jars here.
+    // REEFDriver currently does not add jars to user class path.
     val jars = System.getProperty("spark.jars").split(",")
     for (jar <- jars) {
       addJarToClasspath(jar, loader)
@@ -49,16 +102,11 @@ object REEFDriverDelegate extends Logging {
         var succeeded = false
         try {
           mainMethod.invoke(null, userArgs)
-          // Some apps have "System.exit(0)" at the end.  The user thread will stop here unless
-          // it has an uncaught exception thrown out.  It needs a shutdown hook to set SUCCEEDED.
           succeeded = true
-        } finally {
-          logDebug("Finishing main")
-          if (succeeded) {
-            REEFDriverDelegate.this.finishApplication(true)
-          } else {
-            REEFDriverDelegate.this.finishApplication(false)
-          }
+        } catch{
+          case _: Throwable =>
+            logError("Could not finish User Class")
+            throw new RuntimeException("Error running user class")
         }
       }
     }
@@ -67,6 +115,14 @@ object REEFDriverDelegate extends Logging {
     t
   }
 
+  /**
+   *
+   * Called by startUserClass().
+   * Adds user jars to user class path.
+   *
+   * @param localJar user jars
+   * @param loader ExecutorURLClassLoader
+   */
   private def addJarToClasspath(localJar: String, loader: ExecutorURLClassLoader) {
     val uri = Utils.resolveURI(localJar)
     uri.getScheme match {
@@ -82,81 +138,47 @@ object REEFDriverDelegate extends Logging {
     }
   }
 
-  def finishApplication(status: Boolean) {
-    synchronized {
-      if (status) {
-        return
+  /**
+   *
+   * Called from REEFClusterScheduler.
+   * Notify that a SparkContext has been initialized in the user class.
+   *
+   * @param sc SparkContext
+   * @return Boolean
+   */
+  def sparkContextInitialized(sc: SparkContext): Boolean = {
+    var modified = false
+    sparkContextRef.synchronized {
+      modified = sparkContextRef.compareAndSet(null, sc)
+      //sparkContextRef.notifyAll()
+      // Add a shutdown hook in case users do not call sc.stop or do System.exit.
+      if (modified) {
+        val sparkContext = sparkContextRef.get()
+        val sparkConf = sparkContext.getConf
+        //retrieve spark driver url for SparkExecutorTask
+        REEFDriverDelegate.driverURL = "akka.tcp://spark@%s:%s/user/%s".format(
+          sparkConf.get("spark.driver.host"),
+          sparkConf.get("spark.driver.port"),
+          CoarseGrainedSchedulerBackend.ACTOR_NAME)
+        Runtime.getRuntime().addShutdownHook(new Thread with Logging {
+          logInfo("Adding shutdown hook for SparkContext " + sc)
+
+          override def run() {
+            logInfo("Invoking sc stop from shutdown hook")
+            sc.stop()
+          }
+        })
       } else{
-        logError("Could not finish User Class")
-        return
+        logWarning("Unable to retrieve SparkContext")
+        throw new RuntimeException("SparkContext not initialized")
       }
-    }
-  }
-
-  // This a bit hacky, but we need to wait until the spark.driver.port property has
-  // been set by the Thread executing the user class.
-  def acquiredSparkContext() {
-    logInfo("Waiting for Spark context initialization")
-    try {
-      var sparkContext: SparkContext = null
-      REEFDriverDelegate.sparkContextRef.synchronized {
-        var numTries = 0
-        val waitTime = 10000L
-        val maxNumTries = 10
-        while (REEFDriverDelegate.sparkContextRef.get() == null && numTries < maxNumTries
-          && !isFinished) {
-          logInfo("Waiting for Spark context initialization ... " + numTries)
-          numTries = numTries + 1
-          REEFDriverDelegate.sparkContextRef.wait(waitTime)
-        }
-        sparkContext = REEFDriverDelegate.sparkContextRef.get()
-        assert(sparkContext != null || numTries >= maxNumTries)
-
-        if (sparkContext != null) {
-          sparkConf = sparkContext.conf
-          driverURL = "akka.tcp://spark@%s:%s/user/%s".format(
-              sparkConf.get("spark.driver.host"),
-              sparkConf.get("spark.driver.port"),
-              CoarseGrainedSchedulerBackend.ACTOR_NAME)
-        } else {
-          logWarning("Unable to retrieve SparkContext in spite of waiting for %d, maxNumTries = %d".
-            format(numTries * waitTime, maxNumTries))
-          throw new RuntimeException("SparkContext not initialized")
-        }
-      }
-    } finally {
-      // notify REEFDriver
-      REEFDriverDelegate.doneWithSparkContextInit()
+      modified
     }
   }
 
   /**
-   * REEFClusterScheduler release lock to REEFDriver to notify that
-   * SparkContext is alive.
-   */
-  def doneWithSparkContextInit() {
-    isDoneWithSparkContextInit = true
-    doneWithSparkContextInitMonitor.synchronized {
-      // to wake threads off wait ...
-      doneWithSparkContextInitMonitor.notifyAll()
-    }
-  }
-
-  /**
-   * REEFDriver has to acquire lock before it
-   * launches evaluators
-   */
-  def waitForSparkContextInit() {
-    doneWithSparkContextInitMonitor.synchronized {
-      while (!isDoneWithSparkContextInit) {
-        doneWithSparkContextInitMonitor.wait(1000L)
-      }
-    }
-  }
-
-  /**
-   * REEFDriver release lock to notify that
-   * Evaluators are up
+   * REEFDriver release lock to
+   * notify that Evaluators are up.
    */
   def doneWithREEFEvaluatorInit() {
     isDoneWithREEFEvaluatorInit = true
@@ -167,8 +189,8 @@ object REEFDriverDelegate extends Logging {
   }
 
   /**
-   * REEFClusterScheduler has to acquire lock before it
-   * proceeds with user class
+   * REEFClusterScheduler has to acquire lock
+   * before it proceeds with user class.
    */
   def waitForREEFEvaluatorInit() {
     doneWithREEFEvaluatorInitMonitor.synchronized {
@@ -176,40 +198,6 @@ object REEFDriverDelegate extends Logging {
         doneWithREEFEvaluatorInitMonitor.wait(1000L)
       }
     }
-  }
-
-  /**
-   * Called from REEFClusterScheduler to notify that a SparkContext has been
-   * initialized in the user code.
-   */
-  def sparkContextInitialized(sc: SparkContext): Boolean = {
-    var modified = false
-    sparkContextRef.synchronized {
-      modified = sparkContextRef.compareAndSet(null, sc)
-      sparkContextRef.notifyAll()
-    }
-
-    // Add a shutdown hook - as a best effort in case users do not call sc.stop or do
-    // System.exit.
-    // Should not really have to do this, but it helps REEF to evict resources earlier.
-    // Not to mention, prevent the Client from declaring failure even though we exited properly.
-    // Note that this will unfortunately not properly clean up the staging files because it gets
-    // called too late, after the filesystem is already shutdown.
-    if (modified) {
-      Runtime.getRuntime().addShutdownHook(new Thread with Logging {
-        // This is not only logs, but also ensures that log system is initialized for this instance
-        // when we are actually 'run'-ing.
-        logInfo("Adding shutdown hook for context " + sc)
-
-        override def run() {
-          logInfo("Invoking sc stop from shutdown hook")
-          sc.stop()
-        }
-      })
-    }
-
-    // Wait for initialization to complete and at least 'some' nodes to get allocated.
-    modified
   }
 
 }
