@@ -9,7 +9,7 @@ import org.apache.log4j.PropertyConfigurator
 import org.apache.spark.executor.ExecutorURLClassLoader
 import org.apache.spark.scheduler.cluster.CoarseGrainedSchedulerBackend
 import org.apache.spark.util.Utils
-import org.apache.spark.{Logging, SparkConf, SparkContext, SparkException}
+import org.apache.spark.{Logging, SparkContext, SparkException}
 
 import scala.beans.BeanProperty
 
@@ -23,13 +23,11 @@ object REEFDriverDelegate extends Logging {
   val sparkContextRef: AtomicReference[SparkContext] = new AtomicReference[SparkContext](null)
   //create getter & setter for Spark Driver URL
   @BeanProperty var driverURL: String = null
-  var sparkConf: SparkConf = null
   // variable used to notify the REEFClusterScheduler
   val doneWithREEFEvaluatorInitMonitor = new Object() // lock for REEF Evaluator
   val doneWithSparkContextInitMonitor = new Object() //lock for SparkContext
   @volatile var isDoneWithSparkContextInit = false
   @volatile var isDoneWithREEFEvaluatorInit = false
-  var isFinished: Boolean = false
 
   /**
    *
@@ -68,20 +66,19 @@ object REEFDriverDelegate extends Logging {
 
   /**
    *
-   * Called from REEFDriver.
-   * Runs userClass in a separate Thread.
+   * Called from SparJobHandler.
+   * Runs userClass in current Thread.
    *
    * @param userClass user class
    * @param userArgs user arguments
-   * @return Thread
+   * @return
    */
-  def startUserClass(userClass: String, userArgs: Array[String]): Thread = {
-    logInfo("Starting the user class in a separate Thread")
+  def startUserClass(userClass: String, userArgs: Array[String]) {
+    logInfo("REEFDriverDelegate starting the user class")
 
     val loader = new ExecutorURLClassLoader(new Array[URL](0),
       Thread.currentThread.getContextClassLoader)
     Thread.currentThread.setContextClassLoader(loader)
-
 
     //retrieve log4j.prop here
     val url = loader.getResource("log4j-spark-reef.properties")
@@ -96,23 +93,13 @@ object REEFDriverDelegate extends Logging {
 
     val mainClass = Class.forName(userClass, true, loader)
     val mainMethod = mainClass.getMethod("main", classOf[Array[String]])
-
-    val t = new Thread {
-      override def run() {
-        var succeeded = false
-        try {
-          mainMethod.invoke(null, userArgs)
-          succeeded = true
-        } catch{
-          case _: Throwable =>
-            logError("Could not finish User Class")
-            throw new RuntimeException("Error running user class")
-        }
-      }
+    try {
+      mainMethod.invoke(null, userArgs)
+    } catch{
+      case e: Throwable =>
+        logError("Could not finish User Class: ", e)
+        throw new RuntimeException("Error running user class")
     }
-    t.setName("User Class Main")
-    t.start()
-    t
   }
 
   /**
@@ -141,7 +128,8 @@ object REEFDriverDelegate extends Logging {
   /**
    *
    * Called from REEFClusterScheduler.
-   * Notify that a SparkContext has been initialized in the user class.
+   * Acquire SparkContext that has been initialized in the user class.
+   * Release lock to REEFContextStartHandler to notify that Spark Contest is alive.
    *
    * @param sc SparkContext
    * @return Boolean
@@ -150,29 +138,52 @@ object REEFDriverDelegate extends Logging {
     var modified = false
     sparkContextRef.synchronized {
       modified = sparkContextRef.compareAndSet(null, sc)
-      //sparkContextRef.notifyAll()
       // Add a shutdown hook in case users do not call sc.stop or do System.exit.
       if (modified) {
-        val sparkContext = sparkContextRef.get()
-        val sparkConf = sparkContext.getConf
+        val sparkConf = sparkContextRef.get().getConf
         //retrieve spark driver url for SparkExecutorTask
         REEFDriverDelegate.driverURL = "akka.tcp://spark@%s:%s/user/%s".format(
           sparkConf.get("spark.driver.host"),
           sparkConf.get("spark.driver.port"),
           CoarseGrainedSchedulerBackend.ACTOR_NAME)
-        Runtime.getRuntime().addShutdownHook(new Thread with Logging {
-          logInfo("Adding shutdown hook for SparkContext " + sc)
-
-          override def run() {
-            logInfo("Invoking sc stop from shutdown hook")
-            sc.stop()
-          }
-        })
       } else{
         logWarning("Unable to retrieve SparkContext")
         throw new RuntimeException("SparkContext not initialized")
       }
+      REEFDriverDelegate.doneWithSparkContextInit()
       modified
+    }
+  }
+
+  /**
+   * Called from SparkJobRunner.
+   * Stops SparkContext in case user class does not stops it.
+   */
+  def stopSparkContext() {
+    sparkContextRef.get().stop()
+  }
+
+  /**
+   * REEFDriverDelegate release lock to
+   * notify that SparkContext is alive.
+   */
+  def doneWithSparkContextInit() {
+    isDoneWithSparkContextInit = true
+    doneWithSparkContextInitMonitor.synchronized {
+      // to wake threads off wait ...
+      doneWithSparkContextInitMonitor.notifyAll()
+    }
+  }
+
+  /**
+   * REEFContextStartHandler has to acquire
+   * lock before it can acquire driverURL.
+   */
+  def waitForSparkContextInit() {
+    doneWithSparkContextInitMonitor.synchronized {
+      while (!isDoneWithSparkContextInit) {
+        doneWithSparkContextInitMonitor.wait(1000L)
+      }
     }
   }
 
@@ -189,8 +200,8 @@ object REEFDriverDelegate extends Logging {
   }
 
   /**
-   * REEFClusterScheduler has to acquire lock
-   * before it proceeds with user class.
+   * REEFClusterScheduler has to acquire
+   * lock before it proceeds with user class.
    */
   def waitForREEFEvaluatorInit() {
     doneWithREEFEvaluatorInitMonitor.synchronized {
