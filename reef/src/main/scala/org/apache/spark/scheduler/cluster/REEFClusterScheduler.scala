@@ -5,8 +5,9 @@ import org.apache.spark.scheduler.TaskSchedulerImpl
 import org.apache.spark.deploy.reef.REEFDriverDelegate
 
 /**
- *
- * This is a simple extension to ClusterScheduler - to ensure that appropriate initialization of Evaluators
+ * REEFClusterScheduler class for Spark-REEF API
+ * notify REEFDriverDelegate when SparkContext is created,
+ * and halts user class until REEF Evaluators are up.
  */
 private[spark] class REEFClusterScheduler(sc: SparkContext) extends TaskSchedulerImpl(sc) {
 
@@ -15,7 +16,7 @@ private[spark] class REEFClusterScheduler(sc: SparkContext) extends TaskSchedule
   override def postStartHook() {
     val sparkContextInitialized = REEFDriverDelegate.sparkContextInitialized(sc)
     if (sparkContextInitialized){
-      REEFDriverDelegate.acquiredSparkContext() //notify REEFDriver that SparkContext is alive
+      logInfo("Waiting for REEF Evaluators")
       REEFDriverDelegate.waitForREEFEvaluatorInit() //wait for REEF Evaluator to init
     }
     logInfo("REEFClusterScheduler.postStartHook done")
