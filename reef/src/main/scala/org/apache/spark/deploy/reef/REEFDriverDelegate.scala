@@ -5,7 +5,6 @@ import java.net.URL
 import java.util.Properties
 import java.util.concurrent.atomic.AtomicReference
 
-import org.apache.log4j.PropertyConfigurator
 import org.apache.spark.executor.ExecutorURLClassLoader
 import org.apache.spark.scheduler.cluster.CoarseGrainedSchedulerBackend
 import org.apache.spark.util.Utils
@@ -44,6 +43,7 @@ object REEFDriverDelegate extends Logging {
       properties.load(inputStream)
       setSystemProperties(properties)
     } catch {
+
       case e: IOException =>
         val message = s"Failed when loading Spark properties file $file"
         throw new SparkException(message, e)
@@ -73,32 +73,26 @@ object REEFDriverDelegate extends Logging {
    * @param userArgs user arguments
    * @return
    */
-  def startUserClass(userClass: String, userArgs: Array[String]) {
-    logInfo("REEFDriverDelegate starting the user class")
+  @throws[RuntimeException]
+  def startUserClass(userClass: String, userArgs: Array[String], userJar: Array[String]) {
 
     val loader = new ExecutorURLClassLoader(new Array[URL](0),
       Thread.currentThread.getContextClassLoader)
     Thread.currentThread.setContextClassLoader(loader)
 
-    //retrieve log4j.prop here
-    val url = loader.getResource("log4j-spark-reef.properties")
-    PropertyConfigurator.configure(url)
-
     // Add spark.jars here.
-    // REEFDriver currently does not add jars to user class path.
-    val jars = System.getProperty("spark.jars").split(",")
-    for (jar <- jars) {
+    for (jar <- userJar) {
       addJarToClasspath(jar, loader)
     }
 
-    val mainClass = Class.forName(userClass, true, loader)
-    val mainMethod = mainClass.getMethod("main", classOf[Array[String]])
     try {
+      val mainClass = Class.forName(userClass, true, loader)
+      val mainMethod = mainClass.getMethod("main", classOf[Array[String]])
       mainMethod.invoke(null, userArgs)
-    } catch{
+    } catch {
       case e: Throwable =>
-        logError("Could not finish User Class: ", e)
-        throw new RuntimeException("Error running user class")
+        logError("Could not finish user class")
+        throw new RuntimeException(e)
     }
   }
 
@@ -107,21 +101,23 @@ object REEFDriverDelegate extends Logging {
    * Called by startUserClass().
    * Adds user jars to user class path.
    *
+   * In cluster mode, Spark should assume that
+   * all required jars are sent to local dir by REEF.
+   *
    * @param localJar user jars
    * @param loader ExecutorURLClassLoader
    */
   private def addJarToClasspath(localJar: String, loader: ExecutorURLClassLoader) {
     val uri = Utils.resolveURI(localJar)
+    logInfo(s"Received URI: $uri")
     uri.getScheme match {
-      case "file" | "local" =>
+      case "file" | "local" | null =>
         val file = new File(uri.getPath)
         if (file.exists()) {
           loader.addURL(file.toURI.toURL)
         } else {
-          logWarning(s"Local jar $file does not exist, skipping.")
+          logWarning(s"Local jar $file does not exist.")
         }
-      case _ =>
-        logWarning(s"Skip remote jar $uri.")
     }
   }
 
@@ -129,11 +125,12 @@ object REEFDriverDelegate extends Logging {
    *
    * Called from REEFClusterScheduler.
    * Acquire SparkContext that has been initialized in the user class.
-   * Release lock to REEFContextStartHandler to notify that Spark Contest is alive.
+   * Release lock to REEFContextStartHandler to notify that Spark Context is alive.
    *
    * @param sc SparkContext
-   * @return Boolean
+   * @return Boolean or RuntimeException
    */
+  @throws[RuntimeException]
   def sparkContextInitialized(sc: SparkContext): Boolean = {
     var modified = false
     sparkContextRef.synchronized {
@@ -147,12 +144,12 @@ object REEFDriverDelegate extends Logging {
           sparkConf.get("spark.driver.port"),
           CoarseGrainedSchedulerBackend.ACTOR_NAME)
       } else{
-        logWarning("Unable to retrieve SparkContext")
-        throw new RuntimeException("SparkContext not initialized")
+        logError("Unable to retrieve SparkContext")
+        throw new RuntimeException()
       }
-      REEFDriverDelegate.doneWithSparkContextInit()
-      modified
     }
+    REEFDriverDelegate.doneWithSparkContextInit()
+    modified
   }
 
   /**
