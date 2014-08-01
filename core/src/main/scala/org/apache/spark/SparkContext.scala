@@ -1046,7 +1046,7 @@ class SparkContext(config: SparkConf) extends Logging {
     }
     val callSite = getCallSite
     val cleanedFunc = clean(func)
-    logInfo("t job: " + callSite)
+    logInfo("Starting job: " + callSite)
     val start = System.nanoTime
     dagScheduler.runJob(rdd, cleanedFunc, partitions, callSite, allowLocal,
       resultHandler, localProperties.get)
